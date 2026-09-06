@@ -140,7 +140,7 @@ class TestClosure(CloseSidecarsBase):
         report = self._close()
         self.assertEqual(report["verdict"], "closed")
         self.assertEqual(report["entries"], {"total": 2, "applied": 2, "gone": 0, "decided": 0,
-                                             "undecided": 0, "pending": 0})
+                                             "undecided": 0, "pending": 0, "disabled": 0})
         self.assertEqual(report["sidecars"]["removed"],
                          sorted(["meeting_changes.md", "meeting_needs_review.md", stale_stage1.name, html.name]))
         for name in report["sidecars"]["removed"]:
@@ -229,6 +229,48 @@ class TestClosure(CloseSidecarsBase):
         self.assertEqual(report["decisions_recorded"], 1)
         recorded = queue.list_items(file_path=str(self.transcript), status="kept_original")
         self.assertEqual([(r.original_text, r.line_number) for r in recorded], [("巨神", 7)])
+
+    def test_entry_whose_rule_was_disabled_since_counts_as_closed(self):
+        # The report still says 新一→欣一 and 新一 is still in the file, but the rule
+        # was reported as a false positive after the report was written: nothing
+        # is left to decide, so the entry is `disabled` and the file closes.
+        self._write_transcript(RAW.replace("巨神模型", "具身模型"))
+        service = commands._get_service()
+        service.add_correction("新一", "欣一", "testdom", force=True)
+        self.assertTrue(service.report_false_positive("新一", "欣一", domain="testdom"))
+        report = close_sidecars(self.transcript, self.work, dry_run=True, queue=self._queue(),
+                                disabled_pairs=service.get_disabled_pairs(None))
+        self.assertEqual(report["verdict"], "closed")
+        self.assertEqual((report["entries"]["disabled"], report["entries"]["undecided"]), (1, 0))
+        # and the CLI wires the disabled pairs in by itself
+        code, payload = TestCommandSurface._run(self, dry_run=True)
+        self.assertEqual((code, payload["verdict"], payload["entries"]["disabled"]), (0, "closed", 1))
+
+    def test_rule_still_active_in_another_domain_is_not_retired(self):
+        # Disabled in testdom but active in otherdom: it still fires under otherdom,
+        # so with no --domain the entry stays a question; scoped to testdom it is retired.
+        self._write_transcript(RAW.replace("巨神模型", "具身模型"))
+        service = commands._get_service()
+        service.add_correction("新一", "欣一", "testdom", force=True)
+        self.assertTrue(service.report_false_positive("新一", "欣一", domain="testdom"))
+        service.add_correction("新一", "欣一", "otherdom", force=True)
+        code, payload = TestCommandSurface._run(self, dry_run=True)
+        self.assertEqual((code, payload["verdict"], payload["entries"]["undecided"], payload["entries"]["disabled"]), (1, "open", 1, 0))
+        code, payload = TestCommandSurface._run(self, dry_run=True, domain="testdom")
+        self.assertEqual((code, payload["verdict"], payload["entries"]["disabled"]), (0, "closed", 1))
+
+    def test_pending_row_outranks_a_retired_rule(self):
+        self._write_transcript(RAW.replace("巨神模型", "具身模型"))
+        service = commands._get_service()
+        service.add_correction("新一", "欣一", "testdom", force=True)
+        self.assertTrue(service.report_false_positive("新一", "欣一", domain="testdom"))
+        queue = self._queue()
+        (item_id,) = queue.enqueue([self._row()])["added"]
+        report = close_sidecars(self.transcript, self.work, dry_run=True, queue=queue,
+                                disabled_pairs=service.get_disabled_pairs(None))
+        self.assertEqual(report["verdict"], "open")
+        self.assertEqual((report["entries"]["pending"], report["entries"]["disabled"]), (1, 0))
+        self.assertEqual(report["blockers"]["pending_ids"], [item_id])
 
     def test_pending_queue_row_keeps_the_file_open(self):
         self._write_transcript(RAW.replace("巨神模型", "具身模型"))
